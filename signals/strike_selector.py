@@ -9,7 +9,7 @@ STRIKE_INTERVALS = {
 
 # NSE F&O lot sizes (update periodically as SEBI revises them)
 LOT_SIZES = {
-    'NIFTY':      75,
+    'NIFTY':      65,
     'BANKNIFTY':  15,
     'FINNIFTY':   40,
     'MIDCPNIFTY': 75,

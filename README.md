@@ -44,7 +44,7 @@ python run_strategy.py
 
 | Instrument | Symbol to use | Strike Interval | Lot Size |
 |---|---|---|---|
-| NIFTY 50 | `NIFTY` | 50 pts | 75 |
+| NIFTY 50 | `NIFTY` | 50 pts | 65 |
 | Bank NIFTY | `BANKNIFTY` | 100 pts | 15 |
 | Fin NIFTY | `FINNIFTY` | 50 pts | 40 |
 | MidCap NIFTY | `MIDCPNIFTY` | 25 pts | 75 |
