@@ -3,10 +3,10 @@ LiveEngine — main orchestrator for AlgoTrader India.
 
 Flow every candle interval:
   1. Check market is open (09:15–15:30 IST, Mon–Fri)
-  2. Fetch latest OHLCV candles from Angel One
+  2. Fetch latest OHLCV candles from NSE / yfinance  (no broker account needed)
   3. Run multi-indicator confluence signal engine
   4. If signal changed since last check → send Telegram alert
-  5. If auto_trade=True + signal is BUY/SELL → place CE/PE order via Angel One
+  5. If auto_trade=True + signal is BUY/SELL → place CE/PE order (paper by default)
 
 Run with:
     python run_live.py --tickers NIFTY BANKNIFTY --interval 15m
@@ -19,7 +19,7 @@ from datetime import datetime
 
 import pytz
 
-from data.live_feed import AngelOneFeed
+from data.live_feed import NSEFeed
 from execution.order_manager import OrderManager
 from signals.equity_signals import get_latest_signal
 from signals.strike_selector import recommend_strike
@@ -55,7 +55,7 @@ class LiveEngine:
             auto_trade : if True, places real/paper orders on every new signal.
                          Defaults to False — signals + Telegram only.
         """
-        self.feed         = AngelOneFeed()
+        self.feed         = NSEFeed()
         self.order_mgr    = None
         self.auto_trade   = auto_trade
         self.last_signals = {}          # ticker → last signal label ('BUY'/'SELL'/'WAIT')
@@ -68,8 +68,7 @@ class LiveEngine:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self):
-        """Authenticate with Angel One and initialise the order manager."""
-        self.feed.authenticate()
+        """Initialise the NSE feed and order manager."""
         self.order_mgr = OrderManager(self.feed)
         mode = 'PAPER' if settings.PAPER_TRADING else '⚠️  LIVE'
         logger.info(f"LiveEngine started — mode={mode}  auto_trade={self.auto_trade}")

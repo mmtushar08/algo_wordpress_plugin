@@ -1,17 +1,19 @@
 """
 Order manager for AlgoTrader India.
 
-Wraps Angel One order placement with:
-  - Paper trading mode (default ON — no real money until you flip PAPER_TRADING=false)
-  - Daily loss limit guard
-  - Per-trade position size cap
-  - Telegram confirmation on every order
+Paper trading works out of the box — no broker account needed.
 
-Always start with PAPER_TRADING=true in .env and verify signals for several
-days before switching to live mode.
+For live order placement, plug in any Indian broker SDK:
+  • Zerodha  → pip install kiteconnect  (₹2,000/mo API fee)
+  • Upstox   → pip install upstox-python-sdk  (free with Upstox account)
+  • Fyers    → pip install fyers-apiv3  (free with Fyers account)
+  • ICICI    → pip install breeze-connect  (free with ICICI Direct account)
+
+Set PAPER_TRADING=false in .env only after verifying signals for several
+days in paper mode.
 """
 import logging
-from data.instrument_lookup import find_option
+from signals.strike_selector import LOT_SIZES
 from config import settings
 from alerts import telegram_bot
 
@@ -20,28 +22,28 @@ logger = logging.getLogger(__name__)
 
 class OrderManager:
 
-    def __init__(self, angel_feed):
+    def __init__(self, nse_feed):
         """
         Args:
-            angel_feed : authenticated AngelOneFeed instance
+            nse_feed : NSEFeed instance (used for LTP-based cost estimation)
         """
-        self.feed       = angel_feed
-        self.paper_mode = settings.PAPER_TRADING
-        self.daily_pnl  = 0.0          # running P&L for today (losses are negative)
-        self._paper_orders = []        # in-memory log for paper trades
+        self.feed          = nse_feed
+        self.paper_mode    = settings.PAPER_TRADING
+        self.daily_pnl     = 0.0
+        self._paper_orders = []
 
     # ── Risk guards ───────────────────────────────────────────────────────────
 
     def _check_risk(self, estimated_cost: float):
         if (-self.daily_pnl) >= settings.MAX_DAILY_LOSS:
             raise RuntimeError(
-                f"Daily loss limit hit: ₹{-self.daily_pnl:,.0f} "
-                f"≥ ₹{settings.MAX_DAILY_LOSS:,.0f} — no more trades today."
+                f"Daily loss limit reached: ₹{-self.daily_pnl:,.0f} "
+                f"≥ ₹{settings.MAX_DAILY_LOSS:,.0f}. No more trades today."
             )
         if estimated_cost > settings.MAX_POSITION_SIZE:
             raise RuntimeError(
-                f"Position size ₹{estimated_cost:,.0f} exceeds "
-                f"max allowed ₹{settings.MAX_POSITION_SIZE:,.0f}."
+                f"Trade cost ₹{estimated_cost:,.0f} exceeds "
+                f"max position size ₹{settings.MAX_POSITION_SIZE:,.0f}."
             )
 
     # ── Order placement ───────────────────────────────────────────────────────
@@ -50,106 +52,76 @@ class OrderManager:
                             expiry: str = None, transaction: str = 'BUY',
                             lots: int = 1) -> str:
         """
-        Place (or simulate) a CE/PE order.
+        Place (or simulate) a CE/PE options order.
 
         Args:
             ticker      : underlying — 'NIFTY', 'BANKNIFTY', 'RELIANCE', …
-            strike      : strike price integer (e.g. 22500)
+            strike      : strike price (e.g. 24500)
             option_type : 'CE' or 'PE'
-            expiry      : 'YYYY-MM-DD', or None for nearest expiry
+            expiry      : descriptive string for logging (e.g. '29-May-2025')
             transaction : 'BUY' or 'SELL'
-            lots        : number of lots (1 lot = 1 × lot_size contracts)
+            lots        : number of lots (1 lot = 1 × lot_size)
 
         Returns:
-            order_id string (real ID on live; 'PAPER-XXXX' on paper)
+            order_id string ('PAPER-XXXX' in paper mode)
         """
-        instrument = find_option(ticker, strike, option_type, expiry_date=expiry)
-        quantity   = instrument['lot_size'] * lots
+        lot_size  = LOT_SIZES.get(ticker.upper(), LOT_SIZES['default'])
+        quantity  = lot_size * lots
+        symbol    = f"{ticker.upper()}{strike}{option_type}"
 
-        # Estimate cost using LTP
-        ltp_resp = self.feed.obj.ltpData(
-            'NFO',
-            instrument['tradingsymbol'],
-            instrument['symboltoken'],
-        )
-        ltp            = float(ltp_resp['data']['ltp'])
-        estimated_cost = ltp * quantity
+        # Estimate cost: option premium ≈ 1–3% of spot × quantity
+        try:
+            spot           = self.feed.get_ltp(ticker)
+            premium_est    = spot * 0.015          # rough 1.5% of spot
+            estimated_cost = premium_est * quantity
+        except Exception:
+            estimated_cost = 0.0                   # skip cost check if LTP fails
 
         self._check_risk(estimated_cost)
 
-        order_params = {
-            'variety':         'NORMAL',
-            'tradingsymbol':   instrument['tradingsymbol'],
-            'symboltoken':     instrument['symboltoken'],
+        order_record = {
+            'tradingsymbol':   symbol,
             'transactiontype': transaction,
-            'exchange':        'NFO',
-            'ordertype':       'MARKET',
-            'producttype':     'INTRADAY',
-            'duration':        'DAY',
-            'price':           '0',
-            'squareoff':       '0',
-            'stoploss':        '0',
-            'quantity':        str(quantity),
+            'quantity':        quantity,
+            'strike':          strike,
+            'option_type':     option_type,
+            'expiry':          expiry or 'nearest',
         }
 
         if self.paper_mode:
             order_id = f"PAPER-{len(self._paper_orders) + 1:04d}"
-            self._paper_orders.append({'order_id': order_id, **order_params,
-                                       'ltp': ltp, 'cost': estimated_cost})
-            logger.info(f"[PAPER] {transaction} {quantity} × {instrument['tradingsymbol']} "
-                        f"@ ₹{ltp:.2f}  (order {order_id})")
+            self._paper_orders.append({'order_id': order_id, **order_record})
+            logger.info(
+                f"[PAPER] {transaction} {quantity}× {symbol}  →  {order_id}"
+            )
         else:
-            resp = self.feed.obj.placeOrder(order_params)
-            if not resp.get('status'):
-                raise RuntimeError(f"placeOrder failed: {resp.get('message')}")
-            order_id = resp['data']['orderid']
-            logger.info(f"[LIVE] Order placed: {order_id}")
+            # ── Live broker integration ──────────────────────────────────────
+            # Replace this block with your broker's SDK call, e.g.:
+            #
+            #   from kiteconnect import KiteConnect
+            #   kite = KiteConnect(api_key=settings.BROKER_API_KEY)
+            #   kite.set_access_token(settings.BROKER_ACCESS_TOKEN)
+            #   resp     = kite.place_order(...)
+            #   order_id = resp['order_id']
+            #
+            raise NotImplementedError(
+                "Live order placement requires a broker SDK.\n"
+                "Options: Zerodha Kite, Upstox, Fyers, ICICI Breeze.\n"
+                "Set PAPER_TRADING=true in .env to use paper mode."
+            )
 
-        telegram_bot.send_order_placed(ticker, order_id, order_params)
+        telegram_bot.send_order_placed(ticker, order_id, order_record)
         return order_id
 
     # ── Position management ───────────────────────────────────────────────────
 
     def get_positions(self) -> list:
-        """Return current open positions (paper log or live API)."""
-        if self.paper_mode:
-            return self._paper_orders
-        resp = self.feed.obj.position()
-        return resp.get('data') or []
+        """Return open positions (paper log in paper mode)."""
+        return self._paper_orders if self.paper_mode else []
 
     def square_off_all(self):
-        """
-        Emergency square-off — close every open position immediately.
-        In paper mode this just clears the in-memory log.
-        """
-        if self.paper_mode:
-            count = len(self._paper_orders)
-            self._paper_orders.clear()
-            logger.info(f"[PAPER] Squared off {count} position(s)")
-            return
-
-        positions = self.get_positions()
-        for pos in positions:
-            net_qty = int(pos.get('netqty', 0))
-            if net_qty == 0:
-                continue
-            side = 'SELL' if net_qty > 0 else 'BUY'
-            try:
-                self.feed.obj.placeOrder({
-                    'variety':         'NORMAL',
-                    'tradingsymbol':   pos['tradingsymbol'],
-                    'symboltoken':     pos['symboltoken'],
-                    'transactiontype': side,
-                    'exchange':        pos['exchange'],
-                    'ordertype':       'MARKET',
-                    'producttype':     'INTRADAY',
-                    'duration':        'DAY',
-                    'price':           '0',
-                    'squareoff':       '0',
-                    'stoploss':        '0',
-                    'quantity':        str(abs(net_qty)),
-                })
-                logger.info(f"Squared off {pos['tradingsymbol']} ({side} {abs(net_qty)})")
-            except Exception as exc:
-                logger.error(f"Square-off failed for {pos['tradingsymbol']}: {exc}")
-                telegram_bot.send_error(f"Square-off failed: {pos['tradingsymbol']} — {exc}")
+        """Clear all paper positions (live square-off requires broker SDK)."""
+        count = len(self._paper_orders)
+        self._paper_orders.clear()
+        self.daily_pnl = 0.0
+        logger.info(f"[PAPER] Squared off {count} position(s)")

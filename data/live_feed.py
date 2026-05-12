@@ -1,121 +1,178 @@
 """
-Angel One SmartAPI live data feed.
+NSE India live data feed — no broker account or demat required.
 
-Provides authenticated candle data and LTP for NSE/BSE instruments.
-Uses REST polling (getCandleData) which works on any plan; WebSocket
-streaming can be layered on top using SmartWebSocketV2 if needed.
+Live LTP + options chain  →  NSE India web API  (free, no login)
+Historical OHLCV candles  →  yfinance            (free, no login)
+
+Usage:
+    feed = NSEFeed()
+    ltp  = feed.get_ltp('NIFTY')          # live last traded price
+    data = feed.get_candles('NIFTY', '1d', days=90)   # OHLCV DataFrame
+    oc   = feed.get_option_chain('NIFTY') # full options chain dict
 """
+import time
 import logging
+
+import requests
 import pandas as pd
-import pyotp
+import yfinance as yf
 from datetime import datetime, timedelta
-
-from SmartApi import SmartConnect
-
-from config import settings
-from data.instrument_lookup import INDEX_TOKENS, get_equity_token
 
 logger = logging.getLogger(__name__)
 
-# Map our short interval strings → Angel One API interval names
-INTERVAL_MAP = {
-    '1m':  'ONE_MINUTE',
-    '3m':  'THREE_MINUTE',
-    '5m':  'FIVE_MINUTE',
-    '10m': 'TEN_MINUTE',
-    '15m': 'FIFTEEN_MINUTE',
-    '30m': 'THIRTY_MINUTE',
-    '1h':  'ONE_HOUR',
-    '1d':  'ONE_DAY',
+# yfinance symbols for major NSE instruments
+YF_SYMBOLS = {
+    'NIFTY':      '^NSEI',
+    'BANKNIFTY':  '^NSEBANK',
+    'FINNIFTY':   'NIFTY_FIN_SERVICE.NS',
+    'MIDCPNIFTY': '^NSEMDCP50',
+    'SENSEX':     '^BSESN',
+}
+
+# Display names used by NSE allIndices API
+NSE_INDEX_NAMES = {
+    'NIFTY':      'NIFTY 50',
+    'BANKNIFTY':  'NIFTY BANK',
+    'FINNIFTY':   'NIFTY FIN SERVICE',
+    'MIDCPNIFTY': 'NIFTY MIDCAP SELECT',
+}
+
+NSE_BASE = 'https://www.nseindia.com'
+NSE_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/124.0.0.0 Safari/537.36'
+    ),
+    'Accept':          'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Referer':         'https://www.nseindia.com/',
+    'Connection':      'keep-alive',
 }
 
 
-class AngelOneFeed:
-    """Thin wrapper around SmartConnect for data fetching."""
+class NSEFeed:
+    """
+    Live NSE data feed — no broker account or demat required.
+
+    Live prices and options chain come from NSE's web API.
+    Historical OHLCV candles are fetched via yfinance.
+    """
 
     def __init__(self):
-        self.obj       = None   # SmartConnect instance
-        self.auth_data = None
+        self.session       = requests.Session()
+        self.session.headers.update(NSE_HEADERS)
+        self._ready        = False
 
-    # ── Authentication ────────────────────────────────────────────────────────
+    # ── Session management ────────────────────────────────────────────────────
 
-    def authenticate(self):
+    def _init_session(self):
+        """Visit NSE homepage once to collect cookies needed for API calls."""
+        if self._ready:
+            return
+        try:
+            self.session.get(NSE_BASE, timeout=10)
+            time.sleep(0.5)
+            self._ready = True
+            logger.info('NSE session ready')
+        except Exception as exc:
+            logger.warning(f'NSE session init warning: {exc}')
+
+    # ── Live price ────────────────────────────────────────────────────────────
+
+    def get_ltp(self, ticker: str) -> float:
         """
-        Login to Angel One using API key + client credentials + TOTP.
-        TOTP is generated automatically from the TOTP secret in settings.
-        """
-        totp = pyotp.TOTP(settings.ANGEL_TOTP_TOKEN).now()
-        self.obj = SmartConnect(api_key=settings.ANGEL_API_KEY)
-
-        self.auth_data = self.obj.generateSession(
-            settings.ANGEL_CLIENT_ID,
-            settings.ANGEL_PASSWORD,
-            totp,
-        )
-        if not self.auth_data.get('status'):
-            raise ConnectionError(
-                f"Angel One authentication failed: {self.auth_data.get('message')}"
-            )
-        logger.info("Angel One authenticated successfully")
-        return self.auth_data
-
-    def _ensure_auth(self):
-        if self.obj is None:
-            self.authenticate()
-
-    # ── Market data ───────────────────────────────────────────────────────────
-
-    def get_candles(self, ticker: str, interval: str = '15m', days: int = 60) -> pd.DataFrame:
-        """
-        Fetch OHLCV candles for an NSE equity, index, or F&O contract.
+        Last traded price for a major NSE index or any equity.
 
         Args:
-            ticker   : 'NIFTY', 'BANKNIFTY', 'RELIANCE', 'TCS', etc.
-            interval : '1m' | '5m' | '15m' | '30m' | '1h' | '1d'
-            days     : how many calendar days of history to request
+            ticker : 'NIFTY', 'BANKNIFTY', 'RELIANCE', 'TCS', …
 
         Returns:
-            DataFrame indexed by datetime with columns Open/High/Low/Close/Volume
+            LTP as float (INR)
         """
-        self._ensure_auth()
-        ticker     = ticker.upper()
-        instrument = INDEX_TOKENS.get(ticker) or get_equity_token(ticker)
+        self._init_session()
+        ticker = ticker.upper()
+        return (
+            self._index_ltp(ticker)
+            if ticker in NSE_INDEX_NAMES
+            else self._equity_ltp(ticker)
+        )
+
+    def _index_ltp(self, ticker: str) -> float:
+        resp = self.session.get(f'{NSE_BASE}/api/allIndices', timeout=10)
+        resp.raise_for_status()
+        name = NSE_INDEX_NAMES[ticker]
+        for item in resp.json()['data']:
+            if item['index'] == name:
+                return float(item['last'])
+        raise ValueError(f"Index '{ticker}' not found in NSE response")
+
+    def _equity_ltp(self, ticker: str) -> float:
+        resp = self.session.get(
+            f'{NSE_BASE}/api/quote-equity?symbol={ticker}', timeout=10
+        )
+        resp.raise_for_status()
+        return float(resp.json()['priceInfo']['lastPrice'])
+
+    # ── Historical candles ────────────────────────────────────────────────────
+
+    def get_candles(self, ticker: str, interval: str = '1d',
+                    days: int = 90) -> pd.DataFrame:
+        """
+        OHLCV candles via yfinance — works for both indices and equities.
+
+        Args:
+            ticker   : 'NIFTY', 'BANKNIFTY', 'RELIANCE', etc.
+            interval : '1d' | '1h' | '15m' | '5m'
+            days     : calendar days of history to fetch
+
+        Returns:
+            DataFrame with Open / High / Low / Close / Volume columns
+        """
+        ticker = ticker.upper()
+        symbol = YF_SYMBOLS.get(ticker, ticker + '.NS')
 
         to_dt   = datetime.now()
         from_dt = to_dt - timedelta(days=days)
 
-        params = {
-            'exchange':    instrument['exchange'],
-            'symboltoken': instrument['token'],
-            'interval':    INTERVAL_MAP.get(interval, 'ONE_DAY'),
-            'fromdate':    from_dt.strftime('%Y-%m-%d %H:%M'),
-            'todate':      to_dt.strftime('%Y-%m-%d %H:%M'),
-        }
-
-        resp = self.obj.getCandleData(params)
-        if not resp.get('status'):
-            raise RuntimeError(f"getCandleData error: {resp.get('message')}")
-
-        raw = resp['data']
-        if not raw:
-            raise RuntimeError(f"No candle data returned for {ticker}")
-
-        df = pd.DataFrame(raw, columns=['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        df['Datetime'] = pd.to_datetime(df['Datetime'])
-        df.set_index('Datetime', inplace=True)
-        return df.astype(float)
-
-    def get_ltp(self, ticker: str) -> float:
-        """Return the last traded price for a ticker."""
-        self._ensure_auth()
-        ticker     = ticker.upper()
-        instrument = INDEX_TOKENS.get(ticker) or get_equity_token(ticker)
-
-        resp = self.obj.ltpData(
-            instrument['exchange'],
-            instrument['symbol'],
-            instrument['token'],
+        raw = yf.download(
+            symbol,
+            start    = from_dt.strftime('%Y-%m-%d'),
+            end      = to_dt.strftime('%Y-%m-%d'),
+            interval = interval,
+            progress = False,
+            auto_adjust = True,
         )
-        if not resp.get('status'):
-            raise RuntimeError(f"ltpData error for {ticker}: {resp.get('message')}")
-        return float(resp['data']['ltp'])
+        if raw.empty:
+            raise RuntimeError(
+                f"No data for '{ticker}' ({symbol}). "
+                "Check internet connection and ticker symbol."
+            )
+        # Flatten MultiIndex produced by newer yfinance versions
+        if hasattr(raw.columns, 'levels'):
+            raw.columns = raw.columns.get_level_values(0)
+
+        return raw[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+
+    # ── Options chain ─────────────────────────────────────────────────────────
+
+    def get_option_chain(self, symbol: str = 'NIFTY') -> dict:
+        """
+        Full live options chain from NSE (OI, IV, bid/ask, LTP per strike).
+
+        Args:
+            symbol : 'NIFTY', 'BANKNIFTY', 'FINNIFTY', or any F&O equity
+
+        Returns:
+            NSE 'records' dict — keys: data (list of strikes), expiryDates,
+            strikePrices, underlyingValue, timestamp
+        """
+        self._init_session()
+        symbol = symbol.upper()
+        base   = 'option-chain-indices' if symbol in NSE_INDEX_NAMES else 'option-chain-equities'
+        resp   = self.session.get(
+            f'{NSE_BASE}/api/{base}?symbol={symbol}', timeout=15
+        )
+        resp.raise_for_status()
+        return resp.json()['records']
