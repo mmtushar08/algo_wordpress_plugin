@@ -122,7 +122,12 @@ class LiveEngine:
 
     def _process(self, ticker: str, interval: str, iv: float,
                  days_to_expiry: int, expiry: str):
-        data = self.feed.get_candles(ticker, interval=interval, days=90)
+        try:
+            data = self.feed.get_candles(ticker, interval=interval, days=59)
+        except RuntimeError:
+            # Intraday fetch failed — fall back to daily candles for signal
+            logger.warning(f"  {ticker}: intraday fetch failed, falling back to 1d candles")
+            data = self.feed.get_candles(ticker, interval='1d', days=180)
         sig  = get_latest_signal(data)
         spot = float(data['Close'].iloc[-1])
 

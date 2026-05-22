@@ -20,6 +20,22 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
+# yfinance hard limits on how far back each interval can go
+YF_MAX_DAYS = {
+    '1m':  6,    # 7 calendar days max
+    '2m':  59,
+    '5m':  59,
+    '15m': 59,   # 60-day limit enforced by Yahoo
+    '30m': 59,
+    '60m': 59,
+    '1h':  59,
+    '90m': 59,
+    '1d':  365,
+    '5d':  365,
+    '1wk': 730,
+    '1mo': 1825,
+}
+
 # yfinance symbols for major NSE instruments
 YF_SYMBOLS = {
     'NIFTY':      '^NSEI',
@@ -130,8 +146,12 @@ class NSEFeed:
         Returns:
             DataFrame with Open / High / Low / Close / Volume columns
         """
-        ticker = ticker.upper()
-        symbol = YF_SYMBOLS.get(ticker, ticker + '.NS')
+        ticker   = ticker.upper()
+        symbol   = YF_SYMBOLS.get(ticker, ticker + '.NS')
+
+        # Respect Yahoo Finance's per-interval history limits
+        max_days = YF_MAX_DAYS.get(interval, 59)
+        days     = min(days, max_days)
 
         to_dt   = datetime.now()
         from_dt = to_dt - timedelta(days=days)
